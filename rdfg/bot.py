@@ -1,6 +1,6 @@
 import asyncio
 import sqlite3
-import requests
+import aiohttp
 import os
 import logging
 from aiogram import Bot, Dispatcher, types, F
@@ -31,14 +31,19 @@ def get_main_menu(user_id):
         kb.button(text="🛠 Админка")
     return kb.adjust(2).as_markup(resize_keyboard=True)
 
+def render_progress_bar(percent):
+    """Генерирует визуальную полоску загрузки"""
+    length = 10
+    filled_length = int(length * percent // 100)
+    bar = "█" * filled_length + "░" * (length - filled_length)
+    return f"⏳ **ИИ думает...**\n`[{bar}]` {percent}%"
+
 # --- ЛОГИКА АДМИНКИ ---
 
-# Вызов панели управления пользователями
 @dp.message(F.text == "🛠 Админка")
 async def admin_panel(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     
-    # Получаем список всех одобренных пользователей
     users = db.execute("SELECT id FROM users WHERE status = 'approved' AND id != ?", (ADMIN_ID,)).fetchall()
     
     if not users:
@@ -52,7 +57,6 @@ async def admin_panel(message: types.Message):
     
     await message.answer("Выберите пользователя для удаления доступа:", reply_markup=kb.adjust(1).as_markup())
 
-# Обработка удаления
 @dp.callback_query(F.data.startswith("delete_"))
 async def delete_user(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID: return
@@ -130,6 +134,8 @@ async def handle_message(message: types.Message):
     if message.text in ["🤖 Выбрать модель", "💬 Начать чат", "🛠 Админка"]:
         return
 
+    # Создаем сообщение с прогресс-баром
+    status_msg = await message.answer(render_progress_bar(0), parse_mode="Markdown")
     await bot.send_chat_action(message.chat.id, "typing")
 
     try:
@@ -138,15 +144,38 @@ async def handle_message(message: types.Message):
             "messages": [{"role": "user", "content": message.text}],
             "stream": False
         }
-        response = requests.post(API_URL, json=payload, timeout=300)
-        if response.status_code == 200:
-            result = response.json()
-            answer = result['choices'][0]['message']['content']
-            await message.answer(answer)
-        else:
-            await message.answer(f"Ошибка сервера: {response.status_code}")
+
+        async with aiohttp.ClientSession() as session:
+            # Запускаем запрос к ИИ
+            api_task = asyncio.create_task(session.post(API_URL, json=payload, timeout=300))
+            
+            # Анимация прогресс-бара, пока задача не выполнена
+            progress = 0
+            while not api_task.done():
+                if progress < 90:
+                    progress += 15
+                    try:
+                        await status_msg.edit_text(render_progress_bar(progress), parse_mode="Markdown")
+                    except:
+                        pass # Игнорируем ошибки, если текст не изменился
+                await asyncio.sleep(1.5)
+
+            response = await api_task
+            
+            if response.status == 200:
+                await status_msg.edit_text(render_progress_bar(100), parse_mode="Markdown")
+                result = await response.json()
+                answer = result['choices'][0]['message']['content']
+                
+                # Удаляем прогресс-бар и присылаем финальный ответ
+                await status_msg.delete()
+                await message.answer(answer)
+            else:
+                await status_msg.edit_text(f"Ошибка сервера: {response.status}")
+                
     except Exception as e:
-        await message.answer(f"Произошла ошибка. Проверь ngrok.")
+        logging.error(f"Error: {e}")
+        await status_msg.edit_text(f"Произошла ошибка. Проверь ngrok.")
 
 async def main():
     logging.basicConfig(level=logging.INFO)
