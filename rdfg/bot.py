@@ -3,6 +3,7 @@ import sqlite3
 import aiohttp
 import os
 import logging
+import json
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
@@ -33,86 +34,71 @@ def get_main_menu(user_id):
 
 def render_progress_bar(percent):
     """Генерирует визуальную полоску загрузки"""
+    percent = min(percent, 100) # Чтобы не ушло за 100
     length = 10
     filled_length = int(length * percent // 100)
     bar = "█" * filled_length + "░" * (length - filled_length)
-    return f"⏳ **ИИ думает...**\n`[{bar}]` {percent}%"
+    return f"⏳ **ИИ генерирует ответ...**\n`[{bar}]` {int(percent)}%"
 
 # --- ЛОГИКА АДМИНКИ ---
 
 @dp.message(F.text == "🛠 Админка")
 async def admin_panel(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
-    
     users = db.execute("SELECT id FROM users WHERE status = 'approved' AND id != ?", (ADMIN_ID,)).fetchall()
-    
     if not users:
-        await message.answer("Активных пользователей (кроме вас) нет.")
+        await message.answer("Активных пользователей нет.")
         return
-
     kb = InlineKeyboardBuilder()
     for user in users:
         uid = user[0]
         kb.button(text=f"❌ Удалить {uid}", callback_data=f"delete_{uid}")
-    
-    await message.answer("Выберите пользователя для удаления доступа:", reply_markup=kb.adjust(1).as_markup())
+    await message.answer("Выберите пользователя для удаления:", reply_markup=kb.adjust(1).as_markup())
 
 @dp.callback_query(F.data.startswith("delete_"))
 async def delete_user(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID: return
-    
     uid_to_delete = int(call.data.split("_")[1])
     db.execute("DELETE FROM users WHERE id = ?", (uid_to_delete,))
     db.commit()
-    
-    await call.answer("Пользователь удален")
-    await call.message.edit_text(f"Доступ для ID {uid_to_delete} аннулирован.")
-    
+    await call.answer("Удалено")
+    await call.message.edit_text(f"Доступ для {uid_to_delete} закрыт.")
     try:
-        await bot.send_message(uid_to_delete, "🚫 Ваш доступ к боту был аннулирован администратором.", reply_markup=types.ReplyKeyboardRemove())
-    except:
-        pass
+        await bot.send_message(uid_to_delete, "🚫 Доступ аннулирован.", reply_markup=types.ReplyKeyboardRemove())
+    except: pass
 
-# --- ОСТАЛЬНАЯ ЛОГИКА ---
+# --- ОСНОВНАЯ ЛОГИКА ---
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     res = db.execute("SELECT status FROM users WHERE id = ?", (user_id,)).fetchone()
-
     if user_id == ADMIN_ID:
         db.execute("INSERT OR IGNORE INTO users VALUES (?, ?, ?)", (user_id, MODELS[0], "approved"))
         db.commit()
-        await message.answer("Привет, Админ! Бот готов.", reply_markup=get_main_menu(user_id))
+        await message.answer("Привет, Админ!", reply_markup=get_main_menu(user_id))
         return
-
     if not res:
         db.execute("INSERT INTO users VALUES (?, ?, ?)", (user_id, MODELS[0], "pending"))
         db.commit()
-        await message.answer("Заявка отправлена. Ждите одобрения админом.")
-        kb = InlineKeyboardBuilder()
-        kb.button(text="✅ Одобрить", callback_data=f"approve_{user_id}")
-        await bot.send_message(ADMIN_ID, f"Новый юзер: {message.from_user.full_name} (ID: {user_id})",
-                               reply_markup=kb.as_markup())
+        await message.answer("Заявка отправлена.")
+        kb = InlineKeyboardBuilder().button(text="✅ Одобрить", callback_data=f"approve_{user_id}")
+        await bot.send_message(ADMIN_ID, f"Новый юзер: {user_id}", reply_markup=kb.as_markup())
     elif res[0] == "approved":
-        await message.answer("Доступ есть! Можешь общаться.", reply_markup=get_main_menu(user_id))
-    else:
-        await message.answer("Ваша заявка еще на рассмотрении.")
+        await message.answer("Доступ есть!", reply_markup=get_main_menu(user_id))
 
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve_user(call: types.CallbackQuery):
     user_to_approve = int(call.data.split("_")[1])
     db.execute("UPDATE users SET status = 'approved' WHERE id = ?", (user_to_approve,))
     db.commit()
-    await call.answer("Пользователь одобрен!")
-    await bot.send_message(user_to_approve, "✅ Админ одобрил ваш доступ!", reply_markup=get_main_menu(user_to_approve))
-    await call.message.edit_text(f"Юзер {user_to_approve} успешно добавлен.")
+    await bot.send_message(user_to_approve, "✅ Доступ открыт!", reply_markup=get_main_menu(user_to_approve))
+    await call.message.edit_text(f"Юзер {user_to_approve} добавлен.")
 
 @dp.message(F.text == "🤖 Выбрать модель")
 async def choose_model(message: types.Message):
     kb = InlineKeyboardBuilder()
-    for m in MODELS:
-        kb.button(text=m, callback_data=f"set_{m}")
+    for m in MODELS: kb.button(text=m, callback_data=f"set_{m}")
     await message.answer("Выбери нейросеть:", reply_markup=kb.adjust(1).as_markup())
 
 @dp.callback_query(F.data.startswith("set_"))
@@ -134,48 +120,61 @@ async def handle_message(message: types.Message):
     if message.text in ["🤖 Выбрать модель", "💬 Начать чат", "🛠 Админка"]:
         return
 
-    # Создаем сообщение с прогресс-баром
-    status_msg = await message.answer(render_progress_bar(0), parse_mode="Markdown")
+    status_msg = await message.answer(render_progress_bar(5), parse_mode="Markdown")
     await bot.send_chat_action(message.chat.id, "typing")
 
+    payload = {
+        "model": user_data[0],
+        "messages": [{"role": "user", "content": message.text}],
+        "stream": True # ВКЛЮЧАЕМ СТРИМИНГ
+    }
+
+    full_answer = ""
+    chunk_count = 0
+
     try:
-        payload = {
-            "model": user_data[0],
-            "messages": [{"role": "user", "content": message.text}],
-            "stream": False
-        }
-
         async with aiohttp.ClientSession() as session:
-            # Запускаем запрос к ИИ
-            api_task = asyncio.create_task(session.post(API_URL, json=payload, timeout=300))
-            
-            # Анимация прогресс-бара, пока задача не выполнена
-            progress = 0
-            while not api_task.done():
-                if progress < 90:
-                    progress += 15
-                    try:
-                        await status_msg.edit_text(render_progress_bar(progress), parse_mode="Markdown")
-                    except:
-                        pass # Игнорируем ошибки, если текст не изменился
-                await asyncio.sleep(1.5)
+            async with session.post(API_URL, json=payload, timeout=300) as response:
+                if response.status != 200:
+                    await status_msg.edit_text(f"Ошибка API: {response.status}")
+                    return
 
-            response = await api_task
-            
-            if response.status == 200:
+                # Читаем поток данных от ИИ
+                async for chunk in response.content:
+                    if chunk:
+                        line = chunk.decode("utf-8").strip()
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                            if data_str == "[DONE]": break
+                            
+                            try:
+                                data = json.loads(data_str)
+                                content = data['choices'][0]['delta'].get('content', '')
+                                full_answer += content
+                                chunk_count += 1
+                                
+                                # Обновляем полоску каждые 15 кусочков текста, чтобы не спамить Telegram API
+                                if chunk_count % 15 == 0:
+                                    # Рассчитываем примерный прогресс (чисто визуально на основе накопления текста)
+                                    # так как точный размер ответа ИИ заранее не знает
+                                    progress = min(95, chunk_count // 2) 
+                                    try:
+                                        await status_msg.edit_text(render_progress_bar(progress), parse_mode="Markdown")
+                                    except: pass
+                            except: continue
+
+                # Завершение
                 await status_msg.edit_text(render_progress_bar(100), parse_mode="Markdown")
-                result = await response.json()
-                answer = result['choices'][0]['message']['content']
-                
-                # Удаляем прогресс-бар и присылаем финальный ответ
                 await status_msg.delete()
-                await message.answer(answer)
-            else:
-                await status_msg.edit_text(f"Ошибка сервера: {response.status}")
                 
+                if full_answer:
+                    await message.answer(full_answer)
+                else:
+                    await message.answer("ИИ прислал пустой ответ.")
+
     except Exception as e:
         logging.error(f"Error: {e}")
-        await status_msg.edit_text(f"Произошла ошибка. Проверь ngrok.")
+        await status_msg.edit_text("⚠️ Ошибка связи с нейросетью.")
 
 async def main():
     logging.basicConfig(level=logging.INFO)
